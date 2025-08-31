@@ -1,0 +1,246 @@
+---
+title: "Empirical Bayes in Linear Regression — Hands-on Lecture (R Markdown)"
+author: "Taenyoung Lee"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: readable
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+# 목적
+
+이 문서는 **Empirical Bayes (EB)**를 선형회귀 맥락에서 완전히 이해하고, **임의의 데이터를 생성하여 직접 계산/시각화**하는 것을 목표로 합니다.
+
+- Likelihood, Prior, Posterior의 구조를 수식으로 정리
+- Marginal Likelihood를 통해 하이퍼파라미터 \\(\\tau^2, \\sigma^2\\)를 **경험적(EB)으로 추정**
+- OLS vs EB Posterior 평균 비교 및 **신뢰구간(credible interval) 시각화**
+- 재현 가능한 R 코드 포함
+
+> 수식은 MathJax로 랜더링됩니다. PDF로 knit하려면 `tinytex`가 설치되어 있어야 합니다.
+
+# 준비
+
+```{r setup, message=FALSE, warning=FALSE}
+set.seed(123)
+
+# 필요한 패키지 로드
+pkgs <- c("mvtnorm", "ggplot2", "dplyr", "tibble", "tidyr", "ggrepel")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    message(sprintf("Package '%s' not installed. Please install with install.packages('%s')", p, p))
+  } else {
+    library(p, character.only = TRUE)
+  }
+}
+```
+
+# 모형 정리
+
+## 선형회귀 + 정규 오차 (Likelihood)
+
+\\[
+y = X\\beta + \\epsilon, \\quad \\epsilon \\sim \\mathcal{N}(0, \\sigma^2 I_n).
+\\]
+
+따라서
+\\[
+p(y \\mid \\beta, \\sigma^2) \\propto (\\sigma^2)^{-n/2} \\exp\\!\\Big(-\\tfrac{1}{2\\sigma^2}\\lVert y - X\\beta\\rVert^2\\Big).
+\\]
+
+## Prior (정규 사전분포)
+
+\\[
+\\beta \\sim \\mathcal{N}(0, \\tau^2 I_p).
+\\]
+
+- \\(\\tau^2\\)가 작을수록 \\(\\beta\\)는 0 방향으로 **shrinkage**됩니다.
+
+## Posterior (정규-정규 켤레)
+
+\\[
+p(\\beta \\mid y, X, \\sigma^2, \\tau^2) \\propto p(y \\mid \\beta, \\sigma^2)\\, p(\\beta \\mid \\tau^2).
+\\]
+
+곱의 형태가 정규이므로 posterior도 정규이며,
+\\[
+\\Sigma_\\beta = \\Big(\\tfrac{1}{\\sigma^2} X^\\top X + \\tfrac{1}{\\tau^2} I_p\\Big)^{-1},
+\\quad
+\\mu_\\beta = \\Sigma_\\beta \\cdot \\tfrac{1}{\\sigma^2} X^\\top y.
+\\]
+
+## Empirical Bayes (하이퍼파라미터 추정)
+
+\\(\\beta\\)를 적분 소거하면
+\\[
+y \\sim \\mathcal{N}\\!\\big(0,\\; \\sigma^2 I_n + \\tau^2 X X^\\top\\big),
+\\]
+따라서 **marginal likelihood**는
+\\[
+p(y \\mid X, \\tau^2, \\sigma^2) = \\mathcal{N}\\!\\big(0,\\; \\sigma^2 I_n + \\tau^2 X X^\\top\\big).
+\\]
+
+EB는 이를 **최대화**하여 \\((\\hat{\\tau}^2, \\hat{\\sigma}^2)\\)를 얻고, 이를 posterior에 대입합니다.
+
+# 임의 데이터 생성과 계산
+
+```{r data-gen}
+n <- 60
+x1 <- runif(n, -2, 2)
+x2 <- runif(n, -2, 2)
+X <- cbind(1, x1, x2)  # intercept 포함 (p = 3)
+p <- ncol(X)
+
+beta_true <- c(1, 2, -1)
+sigma_true <- 1.0
+
+y <- as.numeric(X %*% beta_true + rnorm(n, 0, sigma_true))
+
+dat <- tibble(y, x1, x2)
+head(dat)
+```
+
+## OLS 계산
+
+```{r ols}
+XtX_inv <- solve(t(X) %*% X)
+beta_ols <- XtX_inv %*% t(X) %*% y
+rownames(beta_ols) <- c("(Intercept)", "x1", "x2")
+beta_ols
+```
+
+## Empirical Bayes: \\(\\tau^2, \\sigma^2\\)의 경험적 추정
+
+- 파라미터의 양의 제약을 위해 \\(\\log\\tau^2, \\log\\sigma^2\\)를 최적화 변수로 사용합니다.
+- (수치적 안정성을 위해 neg-log-likelihood를 최소화)
+
+```{r eb-estimation, message=FALSE, warning=FALSE}
+negloglik <- function(par) {
+  tau2 <- exp(par[1])
+  sigma2 <- exp(par[2])
+  V <- sigma2 * diag(n) + tau2 * (X %*% t(X))
+  # mvtnorm::dmvnorm는 벡터/행렬 입력에 따라 mean과 sigma 지정 가능
+  # 여기서는 mean=0, sigma=V
+  ll <- mvtnorm::dmvnorm(x = y, mean = rep(0, n), sigma = V, log = TRUE)
+  return(-ll)
+}
+
+opt <- optim(c(log(1), log(1)), negloglik, method = "L-BFGS-B")
+tau2_hat   <- exp(opt$par[1])
+sigma2_hat <- exp(opt$par[2])
+
+tau2_hat; sigma2_hat
+```
+
+## Posterior 계산 (EB 하이퍼파라미터 사용)
+
+```{r posterior}
+Sigma_beta <- solve((1/sigma2_hat) * t(X) %*% X + (1/tau2_hat) * diag(p))
+mu_beta <- Sigma_beta %*% (t(X) %*% y / sigma2_hat)
+
+rownames(mu_beta) <- c("(Intercept)", "x1", "x2")
+colnames(Sigma_beta) <- rownames(Sigma_beta) <- rownames(mu_beta)
+
+mu_beta
+Sigma_beta
+```
+
+# 시각화
+
+## 1) 계수 추정 비교 (True vs OLS vs EB Posterior Mean)
+
+```{r viz-coefs, fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+coef_names <- rownames(mu_beta)
+df_plot <- tibble(
+  term = rep(coef_names, 3),
+  method = rep(c("True", "OLS", "EB (posterior mean)"), each = length(coef_names)),
+  value = c(beta_true, as.numeric(beta_ols), as.numeric(mu_beta))
+)
+
+ggplot(df_plot, aes(x = term, y = value, color = method)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Coefficient Estimates: True vs OLS vs EB",
+       x = NULL, y = "Estimate") +
+  theme_minimal()
+```
+
+## 2) EB Posterior Credible Intervals (95%)
+
+- Posterior가 정규이므로, 각 계수의 95% credible interval은
+  \\[ \\mu_j \\pm 1.96\\, \\sqrt{\\Sigma_{jj}}. \\]
+
+```{r viz-intervals, fig.width=7, fig.height=5}
+post_se <- sqrt(diag(Sigma_beta))
+ci_df <- tibble(
+  term = coef_names,
+  mean = as.numeric(mu_beta),
+  lower = mean - 1.96 * post_se,
+  upper = mean + 1.96 * post_se
+)
+
+ggplot(ci_df, aes(x = term, y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.1) +
+  geom_point(data = tibble(term = coef_names, true = beta_true),
+             aes(x = term, y = true), shape = 4, size = 3) +
+  labs(title = "EB Posterior 95% Credible Intervals (with True Coefficients)",
+       x = NULL, y = "Value") +
+  theme_minimal()
+```
+
+## 3) 계수 주변 posterior 밀도 근사 (정규 근사 곡선)
+
+- Posterior가 정규이므로 각 계수에 대해 밀도곡선을 그려봅니다.
+
+```{r viz-density, fig.width=7, fig.height=5}
+dens_grid <- tidyr::expand_grid(
+  term = coef_names,
+  x = seq(-4, 4, length.out = 400)
+) %>%
+  mutate(mean = rep(as.numeric(mu_beta), each = 400),
+         sd = rep(sqrt(diag(Sigma_beta)), each = 400),
+         d = dnorm(x, mean = mean, sd = sd))
+
+true_df <- tibble(term = coef_names, true = beta_true)
+
+ggplot(dens_grid, aes(x = x, y = d)) +
+  geom_line() +
+  facet_wrap(~ term, scales = "free") +
+  geom_vline(data = true_df, aes(xintercept = true), linetype = "dotted") +
+  labs(title = "Approximate Posterior Densities (Normal) per Coefficient",
+       x = "Coefficient value", y = "Density") +
+  theme_minimal()
+```
+
+# 추가: 예측(선택 사항)
+
+원하면, 새로운 관측치 \\(x_{new}\\)에 대해
+\\[
+y_{new} \\mid y \\sim \\mathcal{N}\\big(x_{new}^\\top\\mu_\\beta,\\; x_{new}^\\top \\Sigma_\\beta x_{new} + \\hat{\\sigma}^2\\big).
+\\]
+
+```{r predict, fig.width=7, fig.height=5}
+x_new <- c(1, 0.5, -0.5)
+pred_mean <- as.numeric(t(x_new) %*% mu_beta)
+pred_var  <- as.numeric(t(x_new) %*% Sigma_beta %*% x_new + sigma2_hat)
+pred_sd   <- sqrt(pred_var)
+c(pred_mean = pred_mean, pred_sd = pred_sd,
+  lower95 = pred_mean - 1.96 * pred_sd,
+  upper95 = pred_mean + 1.96 * pred_sd)
+```
+
+# 요약
+
+- OLS는 점 추정만 제공하지만, EB는 posterior를 통해 **불확실성**을 함께 제공합니다.
+- EB에서 \\(\\tau^2, \\sigma^2\\)는 **marginal likelihood 최대화**로 추정되었습니다.
+- 시뮬레이션 예시에서 EB posterior 평균은 OLS에 비해 **shrinkage**되는 경향이 있으며,
+  credible interval을 통해 각 계수의 추정 불확실성을 수치와 그림으로 확인했습니다.
+  
+  
+  
+  
