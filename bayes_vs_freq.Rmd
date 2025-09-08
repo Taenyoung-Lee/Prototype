@@ -1,0 +1,217 @@
+---
+title: "bayes-vs-freq"
+author: "Taenyoung Lee"
+date: "2025-08-28"
+output: html_document
+---
+
+```{r}
+## =========================================================
+## High-dimensional 비교: Frequentist Lasso vs Bayesian Lasso
+## - 데이터: n=120, p=300 (희소 β, 비정규 오차 약간)
+## - 비교항목: 추정계수, (신뢰/사후)구간, posterior 분포, 예측 RMSE
+## =========================================================
+
+## 0) 패키지 설치 ---------------------------------------------------------------
+need <- c("glmnet", "ggplot2", "patchwork")
+for (pkg in need) if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+
+## Bayesian Lasso는 두 가지 루트를 제공합니다.
+## (A) bayesreg (CRAN) : prior="lasso" 로 Bayesian Lasso 지원
+## (B) monomvn::blasso  : 고전적 blasso 구현
+bayes_pkg <- NULL
+if (requireNamespace("bayesreg", quietly = TRUE)) {
+  bayes_pkg <- "bayesreg"
+} else if (requireNamespace("monomvn", quietly = TRUE)) {
+  bayes_pkg <- "monomvn"
+} else {
+  install.packages("bayesreg")
+  bayes_pkg <- "bayesreg"
+}
+
+library(glmnet)
+library(ggplot2)
+library(patchwork)
+
+## 1) 데이터 생성 ---------------------------------------------------------------
+set.seed(20250828)
+
+n  <- 120
+p  <- 300
+s  <- 12          # true nonzero 개수 (희소성)
+sigma <- 1.0
+
+# 진짜 베타: 앞쪽 s개만 유의, 크기는 점점 작아지게 설정
+beta_true <- numeric(p)
+beta_true[1:s] <- c(2.0, -1.8, 1.5, -1.3, 1.1, -1.0, 0.9, -0.8, 0.7, -0.6, 0.5, -0.4)
+
+# 공분산 약한 상관 구조
+Sigma <- diag(p)
+rho   <- 0.2
+for (i in 1:p) for (j in 1:p) if (i != j) Sigma[i,j] <- rho^(abs(i-j))
+
+# X ~ N(0, Sigma)
+# 빠른 근사: Cholesky (수치적으로 불안하면 MASS::mvrnorm 사용)
+if (!requireNamespace("MASS", quietly = TRUE)) install.packages("MASS")
+X <- MASS::mvrnorm(n, mu = rep(0, p), Sigma = Sigma)
+
+# 약간 heavy-tailed 오차 (혼합: 80% N(0,1) + 20% N(0,3^2))
+eps <- rnorm(n, 0, sigma)
+ix  <- sample.int(n, size = round(0.2*n))
+eps[ix] <- rnorm(length(ix), 0, 3.0)
+
+y <- as.vector(X %*% beta_true + eps)
+
+# train/test 분할
+set.seed(20250828)
+id  <- sample.int(n, size = round(0.75*n))
+Xtr <- X[id, ]; ytr <- y[id]
+Xte <- X[-id,]; yte <- y[-id]
+
+## 2) Frequentist Lasso (cv.glmnet) --------------------------------------------
+set.seed(20250828)
+cvfit <- cv.glmnet(Xtr, ytr, alpha = 1, family = "gaussian", standardize = TRUE, nfolds = 10)
+lam_min <- cvfit$lambda.min
+lam_1se <- cvfit$lambda.1se
+
+b_lasso_min <- as.vector(coef(cvfit, s = lam_min))[-1]   # (intercept 제외)
+b_lasso_1se <- as.vector(coef(cvfit, s = lam_1se))[-1]
+
+# test RMSE
+pred_min <- as.vector(predict(cvfit, newx = Xte, s = lam_min))
+pred_1se <- as.vector(predict(cvfit, newx = Xte, s = lam_1se))
+rmse <- function(a,b) sqrt(mean((a-b)^2))
+rmse_lasso_min <- rmse(yte, pred_min)
+rmse_lasso_1se <- rmse(yte, pred_1se)
+
+## 3) Bayesian Lasso ------------------------------------------------------------
+## (A) bayesreg 사용: posterior sample로 credible interval 계산
+## (B) monomvn::blasso 사용: beta sample 추출
+if (bayes_pkg == "bayesreg") {
+  library(bayesreg)
+
+  ## 훈련/시험 데이터프레임 준비: 열이름을 맞추는 게 핵심
+  df_tr <- data.frame(ytr = ytr, Xtr)
+  colnames(df_tr) <- c("ytr", paste0("X", 1:ncol(Xtr)))
+
+  Xte_df <- data.frame(Xte)
+  colnames(Xte_df) <- paste0("X", 1:ncol(Xte))
+
+  ## bayesreg 호출: 인자 이름 주의 (n.samples, burnin, thin, model/prior)
+  set.seed(20250828)
+  fit_bayes <- bayesreg::bayesreg(
+    ytr ~ ., data = df_tr,
+    model = "gaussian",    # or "normal"
+    prior = "lasso",       # ridge / hs / hs+ 등도 가능
+    n.samples = 4000,
+    burnin    = 1000,
+    thin      = 2,
+    n.cores   = 1          # WSL에서 과한 병렬은 피하는 게 안전
+  )
+
+  ## 사후 표본(계수) 요약
+  beta_draws   <- fit_bayes$beta                 # (iter x p)
+  b_bayes_mean <- colMeans(beta_draws)
+  ci_bayes     <- t(apply(beta_draws, 2, quantile, probs = c(0.025, 0.5, 0.975)))
+  colnames(ci_bayes) <- c("l95","med","u95")
+
+  ## 예측은 predict()로 (사후평균/베이즈 평균 등 선택 가능)
+  pred_bayes   <- as.vector(predict(fit_bayes, newdata = Xte_df, type = "mean"))
+  rmse_bayes   <- sqrt(mean((yte - pred_bayes)^2))
+
+} else {
+  library(monomvn)
+  Xtr_s <- scale(Xtr)
+  Xte_s <- scale(Xte, center = attr(Xtr_s, "scaled:center"), scale = attr(Xtr_s, "scaled:scale"))
+  bl <- monomvn::blasso(Xtr_s, ytr, T = 6000, thin = 2, RJ = FALSE, verb = 0)
+  beta_draws   <- t(bl$beta)
+  b_bayes_mean <- colMeans(beta_draws)
+  ci_bayes     <- t(apply(beta_draws, 2, quantile, probs = c(0.025, 0.5, 0.975)))
+  colnames(ci_bayes) <- c("l95","med","u95")
+
+  pred_bayes   <- as.vector(Xte_s %*% b_bayes_mean + mean(ytr - as.vector(Xtr_s %*% b_bayes_mean)))
+  rmse_bayes   <- sqrt(mean((yte - pred_bayes)^2))
+}
+
+
+## 4) 비교용 데이터프레임 -------------------------------------------------------
+coef_df <- data.frame(
+  idx = 1:p,
+  beta_true = beta_true,
+  lasso_min = b_lasso_min,
+  lasso_1se = b_lasso_1se,
+  bayes_mean = b_bayes_mean,
+  bayes_l95 = ci_bayes[,"l95"],
+  bayes_u95 = ci_bayes[,"u95"]
+)
+
+## 5) 시각화 1: 진짜 β와 추정치 비교 (상위 중요변수만) ---------------------------
+## 중요도 지표: |bayes_mean| 또는 |lasso_min| 기준 상위 20개
+topk <- 20
+top_idx <- head(order(-abs(coef_df$bayes_mean)), topk)
+plot_df <- coef_df[top_idx, ]
+plot_df$var <- factor(paste0("X", plot_df$idx), levels = paste0("X", plot_df$idx[order(plot_df$bayes_mean)]))
+
+p1 <- ggplot(plot_df, aes(x = var, y = beta_true)) +
+  geom_col(fill = "grey70") +
+  coord_flip() +
+  labs(title = "True β (Top by |Bayes mean|)", x = "", y = "β") +
+  theme_bw(base_size = 12)
+
+p2 <- ggplot(plot_df, aes(x = var, y = lasso_min)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Lasso (λ_min) point estimates", x = "", y = "β̂") +
+  theme_bw(base_size = 12)
+
+p3 <- ggplot(plot_df, aes(x = var, y = bayes_mean)) +
+  geom_errorbar(aes(ymin = bayes_l95, ymax = bayes_u95), width = 0.2) +
+  geom_point(size = 1.6) +
+  coord_flip() +
+  labs(title = "Bayesian Lasso posterior (mean & 95% CI)", x = "", y = "β (posterior)") +
+  theme_bw(base_size = 12)
+
+(p1 | p2 | p3)
+
+## 6) 시각화 2: 베이지안 사후분포 밀도 (몇 개 변수) -----------------------------
+## 신호변수 3개와 잡음변수 2개 선택
+signal_ids <- which(beta_true != 0)[1:3]
+noise_ids  <- setdiff(1:p, which(beta_true != 0))[1:2]
+sel_ids    <- c(signal_ids, noise_ids)
+
+dens_list <- lapply(sel_ids, function(j){
+  data.frame(beta = beta_draws[, j], var = paste0("X", j), truth = beta_true[j])
+})
+dens_df <- do.call(rbind, dens_list)
+
+p_dens <- ggplot(dens_df, aes(x = beta)) +
+  geom_density() +
+  facet_wrap(~ var, scales = "free", ncol = 3) +
+  geom_vline(aes(xintercept = truth), linetype = 2) +
+  labs(title = "Bayesian Lasso posterior densities (selected β)",
+       x = "β", y = "density") +
+  theme_bw(base_size = 12)
+p_dens
+
+## 7) 시각화 3: 예측 성능 비교 ---------------------------------------------------
+rmse_df <- data.frame(
+  model = c("Lasso (lambda.min)", "Lasso (lambda.1se)", "Bayesian Lasso"),
+  RMSE  = c(rmse_lasso_min, rmse_lasso_1se, rmse_bayes)
+)
+p_rmse <- ggplot(rmse_df, aes(x = model, y = RMSE)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.3f", RMSE)), vjust = -0.4, size = 4) +
+  labs(title = "Test RMSE comparison", x = "", y = "RMSE") +
+  theme_bw(base_size = 12)
+p_rmse
+
+## 8) 해석 가이드 출력 -----------------------------------------------------------
+cat("\n================= SUMMARY =================\n")
+cat(sprintf("Lasso  (lambda.min)  Test RMSE: %.4f\n", rmse_lasso_min))
+cat(sprintf("Lasso  (lambda.1se)  Test RMSE: %.4f\n", rmse_lasso_1se))
+cat(sprintf("Bayesian Lasso       Test RMSE: %.4f\n", rmse_bayes))
+cat("Note: 신호 강도/희소성/오차 분포에 따라 우열이 바뀔 수 있습니다.\n")
+cat("      Bayesian Lasso는 사후분포로 불확실성(credible interval)까지 제공합니다.\n")
+
+```
+
