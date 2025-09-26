@@ -1,0 +1,140 @@
+---
+title: "Toy ls_kpca"
+author: "Taenyoung Lee"
+date: "2025-09-26"
+output: html_document
+---
+
+```{r}
+library(ggplot2)
+
+# 1. 커널 함수 정의 (RBF Kernel)
+# 두 벡터 또는 행렬 간의 RBF 커널 값을 계산합니다.
+rbf_kernel <- function(X1, X2 = NULL, sigma = 1.0) {
+  if (is.null(X2)) X2 <- X1
+  n1 <- nrow(X1)
+  n2 <- nrow(X2)
+  K <- matrix(0, n1, n2)
+  
+  # 벡터화된 연산을 통해 효율적으로 커널 매트릭스 계산
+  for (i in 1:n1) {
+    for (j in 1:n2) {
+      K[i, j] <- exp(-sum((X1[i, ] - X2[j, ])^2) / (2 * sigma^2))
+    }
+  }
+  return(K)
+}
+
+# 2. LS-KPCA 핵심 함수
+ls_kpca <- function(X, k, sigma = 1.0, lambda = 0.1, max_iter = 20, tol = 1e-4) {
+  n <- nrow(X)
+  
+  # (1) 전체 데이터에 대한 기본 커널 행렬 K 계산
+  K <- rbf_kernel(X, sigma = sigma)
+  
+  # (2) 변수 초기화
+  s <- rep(0, n) # 이동 변수 s (outlier score)
+  w <- rep(1, n) # 가중치 w (s에 따라 결정)
+  
+  cat("Starting LS-KPCA Optimization...\n")
+  
+  # (3) 주성분(U)과 이동 변수(s)를 번갈아 최적화
+  for (iter in 1:max_iter) {
+    s_old <- s
+    
+    # --- STEP 1: 주성분(U) 업데이트 (Weighted KPCA 수행) ---
+    W <- diag(sqrt(w)) # 가중치 행렬 (sqrt(W) K sqrt(W) 형태를 위해)
+    K_w <- W %*% K %*% W # 가중치가 적용된 커널
+    
+    # 커널 행렬 중앙화 (Centering)
+    Ones <- matrix(1, n, n) / n
+    K_c <- K_w - Ones %*% K_w - K_w %*% Ones + Ones %*% K_w %*% Ones
+    
+    # 고유값 분해를 통해 주성분(alpha) 찾기
+    eig <- eigen(K_c, symmetric = TRUE)
+    alpha <- eig$vectors[, 1:k, drop = FALSE]
+    
+    # 고유값으로 정규화 (KPCA 표준 절차)
+    # 0에 가까운 작은 고유값에 대한 나눗셈 방지
+    eigenvalues <- eig$values[1:k]
+    safe_sqrt_eigenvalues <- sqrt(pmax(eigenvalues, 1e-9))
+    alpha <- sweep(alpha, 2, safe_sqrt_eigenvalues, FUN = "/")
+    
+    # --- STEP 2: 이동 변수(s) 업데이트 ---
+    # 현재 주성분(alpha)을 기준으로 재구성 오류(E) 계산
+    # 재구성 오류 E_i = ||phi(x_i)||^2 - ||proj(phi(x_i))||^2
+    # 여기서 ||phi(x_i)||^2 = K[i,i]
+    projections <- K %*% alpha
+    E <- diag(K) - rowSums(projections^2)
+    
+    # L1 페널티에 대한 s 업데이트 (Soft-thresholding과 유사)
+    # s_i = max(0, E_i - lambda) 형태
+    s <- pmax(0, E - lambda)
+    
+    # --- STEP 3: 가중치(w) 업데이트 ---
+    # s 값을 기반으로 다음 반복에 사용할 가중치 w 계산
+    # s가 크면(이상치) 가중치가 0에 가까워짐
+    w <- 1 / (1 + 10 * s) # 10을 곱해 s의 영향을 더 크게 만듦
+    
+    # --- 수렴 확인 ---
+    change <- sqrt(sum((s - s_old)^2))
+    cat(sprintf("Iter %d, Change in s: %.6f\n", iter, change))
+    if (change < tol) {
+      cat("Converged.\n")
+      break
+    }
+  }
+  
+  return(list(
+    X = X,
+    s = s, # 최종 이상치 점수
+    alpha = alpha, # 주성분 계수
+    K = K,
+    k = k,
+    sigma = sigma
+  ))
+}
+
+# 3. 예제 데이터 생성
+set.seed(42)
+# (1) 정상 데이터: 부드러운 곡선 형태
+n_normal <- 100
+t <- seq(0, 2 * pi, length.out = n_normal)
+X_normal <- data.frame(x = 2 * cos(t) + rnorm(n_normal, 0, 0.1), 
+                       y = sin(2 * t) + rnorm(n_normal, 0, 0.1))
+
+# (2) 이상치 데이터: 정상 데이터 분포에서 멀리 떨어진 지점
+n_outlier <- 10
+X_outlier <- data.frame(x = runif(n_outlier, -2, 2), 
+                        y = runif(n_outlier, 1.5, 2.5))
+
+# 데이터 합치기
+X_total <- rbind(X_normal, X_outlier)
+labels <- c(rep("Normal", n_normal), rep("Outlier", n_outlier))
+X_total$label <- as.factor(labels)
+
+# 4. LS-KPCA 모델 실행
+# lambda: 이 값을 조절하여 이상치를 얼마나 민감하게 잡아낼지 결정.
+# 값이 크면 정말 확실한 이상치만 s가 커지고, 작으면 작은 오류에도 s가 반응.
+result <- ls_kpca(as.matrix(X_total[, 1:2]), k = 2, sigma = 1, lambda = 0.1)
+
+# 5. 결과 시각화
+X_total$outlier_score_s <- result$s
+
+p <- ggplot(X_total, aes(x = x, y = y)) +
+  # 이상치 점수(s)를 점의 크기와 색상으로 표현
+  geom_point(aes(color = outlier_score_s, size = outlier_score_s, shape = label), alpha = 0.8) +
+  scale_color_gradient(low = "blue", high = "red", name = "Outlier Score (s)") +
+  scale_size_continuous(range = c(2, 8), name = "Outlier Score (s)") +
+  scale_shape_manual(values = c("Normal" = 16, "Outlier" = 17)) +
+  labs(
+    title = "LS-KPCA 결과: 이상치 탐지",
+    subtitle = "색이 붉고 클수록 이상치 점수(s)가 높음",
+    x = "Feature 1", y = "Feature 2"
+  ) +
+  theme_minimal() +
+  guides(shape = guide_legend(title = "실제 라벨"))
+
+print(p)
+```
+
