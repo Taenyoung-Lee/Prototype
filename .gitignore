@@ -1,0 +1,12 @@
+# R에서 생성되는 파일 무시
+.Rhistory
+.Rapp.history
+.RData
+.Rproj.user/
+.html
+.tex
+
+# =========================
+# OS / System-specific files
+# =========================
+Zone.Identifier
