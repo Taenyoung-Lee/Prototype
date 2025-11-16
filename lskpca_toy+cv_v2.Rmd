@@ -1,0 +1,737 @@
+---
+title: "lskpca"
+author: "Taenyoung Lee"
+date: "2025-11-16"
+output: html_document
+---
+
+```{r}
+############################################################
+## 0. 유틸리티: ROC-AUC
+############################################################
+
+roc_auc <- function(score, label) {
+  # label: 1 = outlier, 0 = inlier
+  stopifnot(length(score) == length(label))
+  pos <- (label == 1)
+  P <- sum(pos)
+  N <- sum(!pos)
+  if (P == 0 || N == 0) return(NA_real_)
+  
+  r <- rank(score, ties.method = "average")
+  sum_r_pos <- sum(r[pos])
+  auc <- (sum_r_pos - P * (P + 1) / 2) / (P * N)
+  auc
+}
+
+############################################################
+## 1. 데이터 생성: Gaussian + mean-shift outlier
+############################################################
+
+make_ar1_cov <- function(d, rho = 0.5) {
+  idx <- 1:d
+  outer(idx, idx, function(i, j) rho ^ abs(i - j))
+}
+
+generate_data <- function(n = 600,
+                          d = 16,
+                          contamination = 0.1,
+                          mu_shift = 6,
+                          rho = 0.5,
+                          seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  n_out <- round(n * contamination)
+  n_in  <- n - n_out
+  
+  Sigma <- make_ar1_cov(d, rho)
+  L <- chol(Sigma)
+  
+  # inlier: N(0, Sigma)
+  X_in <- matrix(rnorm(n_in * d), n_in, d) %*% L
+  
+  # outlier: mean-shift 방향 (1,...,1)/sqrt(d)
+  dir_vec <- rep(1, d)
+  dir_vec <- dir_vec / sqrt(sum(dir_vec^2))
+  mu_vec <- mu_shift * dir_vec
+  
+  X_out <- matrix(rnorm(n_out * d), n_out, d) + 
+    matrix(rep(mu_vec, each = n_out), n_out, d, byrow = FALSE)
+  
+  X <- rbind(X_in, X_out)
+  y <- c(rep(0, n_in), rep(1, n_out))  # 0=inlier, 1=outlier
+  
+  idx <- sample(1:nrow(X))
+  X <- X[idx, , drop = FALSE]
+  y <- y[idx]
+  
+  list(X = X, y = y)
+}
+
+############################################################
+## 2. RBF 커널
+############################################################
+
+rbf_kernel <- function(X, sigma = NULL) {
+  n <- nrow(X)
+  D2 <- as.matrix(dist(X))^2
+  
+  if (is.null(sigma)) {
+    med <- median(D2[upper.tri(D2)])
+    sigma <- sqrt(med / 2)
+  }
+  
+  K <- exp(-D2 / (2 * sigma^2))
+  list(K = K, sigma = sigma)
+}
+
+############################################################
+## 3. weighted KPCA: weighted centering + eigen
+############################################################
+
+weighted_kpca_from_weights <- function(K, w, r) {
+  n <- nrow(K)
+  stopifnot(length(w) == n)
+  w <- as.numeric(w)
+  if (any(w < 0)) stop("weights must be nonnegative")
+  s_w <- sum(w)
+  if (s_w <= 0) stop("sum of weights must be > 0")
+  w <- w / s_w  # normalize to sum 1
+  
+  # ---- weighted centering ----
+  Kw  <- K %*% w                     # length n
+  wK  <- as.numeric(t(w) %*% K)      # length n
+  kwk <- as.numeric(t(w) %*% Kw)     # scalar
+  
+  # Kc_ij = K_ij - (w^T K)_j - (K w)_i + w^T K w
+  Kc <- K -
+    matrix(wK, nrow = n, ncol = n, byrow = TRUE) -
+    matrix(Kw, nrow = n, ncol = n, byrow = FALSE) +
+    kwk
+  
+  # ---- eigen of G = sqrt(W) Kc sqrt(W) ----
+  sqrtw <- sqrt(w)
+  D <- diag(sqrtw)
+  G <- D %*% Kc %*% D
+  
+  eig <- eigen(G, symmetric = TRUE)
+  lam_all <- eig$values
+  vec_all <- eig$vectors
+  
+  pos <- which(lam_all > 1e-10)
+  if (length(pos) == 0) stop("No positive eigenvalues in weighted KPCA.")
+  
+  if (length(pos) < r) {
+    warning(sprintf("Only %d positive eigenvalues; reducing r.", length(pos)))
+    r_use <- length(pos)
+  } else {
+    r_use <- r
+  }
+  
+  lam <- lam_all[pos[1:r_use]]
+  V   <- vec_all[, pos[1:r_use], drop = FALSE]
+  
+  # alpha_{jm} = sqrt(w_j) * v_{jm} / sqrt(lambda_m)
+  alpha <- matrix(0, nrow = n, ncol = r_use)
+  for (m in 1:r_use) {
+    alpha[, m] <- sqrtw * V[, m] / sqrt(lam[m])
+  }
+  
+  # scores T = Kc %*% alpha
+  T <- Kc %*% alpha
+  diag_kc <- diag(Kc)
+  
+  E2 <- pmax(diag_kc - rowSums(T^2), 0)
+  E  <- sqrt(E2)
+  
+  list(
+    w = w,
+    Kc = Kc,
+    lam = lam,
+    alpha = alpha,
+    E = E
+  )
+}
+
+############################################################
+## 4. OOS 재구성 오차 (train에서 학습된 weighted KPCA → val)
+############################################################
+
+reconstruction_error_oos_weighted <- function(K_full,
+                                              train_idx,
+                                              val_idx,
+                                              w_train,
+                                              lam,
+                                              alpha) {
+  K_train <- K_full[train_idx, train_idx, drop = FALSE]
+  n_train <- length(train_idx)
+  r_use   <- length(lam)
+  
+  # train 기준 weighted centering 정보
+  Kw  <- K_train %*% w_train
+  wK  <- as.numeric(t(w_train) %*% K_train)
+  kwk <- as.numeric(t(w_train) %*% Kw)
+  
+  E_val <- numeric(length(val_idx))
+  
+  for (ii in seq_along(val_idx)) {
+    i <- val_idx[ii]
+    
+    k_i_train <- K_full[i, train_idx]
+    mean_k_i  <- sum(k_i_train * w_train)
+    
+    # k_c(i,j)
+    k_c_i_train <- k_i_train - wK - mean_k_i + kwk
+    
+    # scores
+    t_vec <- as.numeric(k_c_i_train %*% alpha)  # length r_use
+    
+    # k_c(i,i)
+    k_c_ii <- K_full[i, i] - 2 * mean_k_i + kwk
+    
+    E2 <- max(k_c_ii - sum(t_vec^2), 0)
+    E_val[ii] <- sqrt(E2)
+  }
+  
+  E_val
+}
+
+############################################################
+## 5. (p,q,lambda) 일반 shift 업데이트 (1D 최소화)
+############################################################
+
+update_shift_scalar <- function(Ei, p, q, lambda,
+                                upper_factor = 5) {
+  if (Ei <= 0) return(0)
+  
+  f_obj <- function(s) {
+    (1 / p) * abs(Ei - s)^p + lambda * (1 / q) * abs(s)^q
+  }
+  
+  U <- Ei + upper_factor * (Ei + 1)
+  
+  opt <- tryCatch(
+    optimize(f_obj, interval = c(0, U), tol = 1e-6),
+    error = function(e) NULL
+  )
+  
+  if (is.null(opt)) {
+    return(max(Ei - 1, 0))
+  } else {
+    return(max(opt$minimum, 0))
+  }
+}
+
+update_shift_all <- function(E, p, q, lambda) {
+  sapply(E, update_shift_scalar, p = p, q = q, lambda = lambda)
+}
+
+############################################################
+## 6. IRLS 가중치 업데이트 (LS-KPCA용)
+##    w_i ∝ |E_i - s_i|^{p-2}
+############################################################
+
+update_irls_weights <- function(E, s, p,
+                                eps = 1e-6,
+                                cap = 1e6) {
+  r <- E - s
+  r_abs <- pmax(abs(r), eps)
+  exponent <- p - 2
+  
+  w_raw <- r_abs^exponent
+  w_raw[!is.finite(w_raw)] <- cap
+  w_raw <- pmin(w_raw, cap)
+  
+  s_w <- sum(w_raw)
+  if (s_w <= 0) {
+    w <- rep(1 / length(E), length(E))
+  } else {
+    w <- w_raw / s_w
+  }
+  w
+}
+
+############################################################
+## 7. LS-KPCA (L_p-L_q) + IRLS weighted KPCA
+############################################################
+
+ls_kpca_irls_weighted <- function(K,
+                                  r = 2,
+                                  p = 2,
+                                  q = 1,
+                                  lambda = 1,
+                                  max_iter = 20,
+                                  tol = 1e-4,
+                                  verbose = TRUE) {
+  n <- nrow(K)
+  
+  # 초기: uniform
+  w <- rep(1 / n, n)
+  
+  model <- weighted_kpca_from_weights(K, w, r)
+  E <- model$E
+  s <- update_shift_all(E, p = p, q = q, lambda = lambda)
+  
+  loss_term <- (1 / p) * abs(E - s)^p + lambda * (1 / q) * abs(s)^q
+  obj_old <- sum(loss_term)
+  if (verbose) cat(sprintf("Init LS-KPCA: obj = %.6f\n", obj_old))
+  
+  for (it in 1:max_iter) {
+    # w-step
+    w <- update_irls_weights(E, s, p = p)
+    
+    # U-step
+    model <- weighted_kpca_from_weights(K, w, r)
+    E <- model$E
+    
+    # s-step
+    s <- update_shift_all(E, p = p, q = q, lambda = lambda)
+    
+    loss_term <- (1 / p) * abs(E - s)^p + lambda * (1 / q) * abs(s)^q
+    obj_new <- sum(loss_term)
+    
+    if (verbose) {
+      cat(sprintf("LS Iter %2d: obj = %.6f, Δ = %.3e\n",
+                  it, obj_new, obj_new - obj_old))
+    }
+    
+    if (abs(obj_new - obj_old) < tol * (abs(obj_old) + 1e-8)) {
+      if (verbose) cat("LS-KPCA converged.\n")
+      obj_old <- obj_new
+      break
+    }
+    
+    obj_old <- obj_new
+  }
+  
+  list(
+    w = model$w,
+    Kc = model$Kc,
+    lam = model$lam,
+    alpha = model$alpha,
+    E = E,
+    s = s,
+    obj = obj_old
+  )
+}
+
+############################################################
+## 8. LS-KPCA: OOS에서 outlier score (s*)
+############################################################
+
+outlier_score_oos_ls <- function(K_full,
+                                 train_idx,
+                                 val_idx,
+                                 w_train,
+                                 lam,
+                                 alpha,
+                                 p,
+                                 q,
+                                 lambda) {
+  E_val <- reconstruction_error_oos_weighted(
+    K_full   = K_full,
+    train_idx = train_idx,
+    val_idx   = val_idx,
+    w_train   = w_train,
+    lam       = lam,
+    alpha     = alpha
+  )
+  s_val <- update_shift_all(E_val, p = p, q = q, lambda = lambda)
+  list(E = E_val, s = s_val)
+}
+
+############################################################
+## 9. Lp-KPCA (shift 없는 robust KPCA) + IRLS
+##    -> FCPCA/L_{2,p} 스타일 벤치마크
+############################################################
+
+lp_kpca_irls_weighted <- function(K,
+                                  r = 2,
+                                  p = 1.0,
+                                  max_iter = 20,
+                                  tol = 1e-4,
+                                  verbose = TRUE) {
+  n <- nrow(K)
+  w <- rep(1 / n, n)
+  
+  model <- weighted_kpca_from_weights(K, w, r)
+  E <- model$E
+  obj_old <- sum((1 / p) * abs(E)^p)
+  if (verbose) cat(sprintf("Init Lp-KPCA: obj = %.6f\n", obj_old))
+  
+  for (it in 1:max_iter) {
+    # IRLS weight (s=0)
+    w <- update_irls_weights(E, s = rep(0, n), p = p)
+    
+    model <- weighted_kpca_from_weights(K, w, r)
+    E <- model$E
+    obj_new <- sum((1 / p) * abs(E)^p)
+    
+    if (verbose) {
+      cat(sprintf("Lp Iter %2d: obj = %.6f, Δ = %.3e\n",
+                  it, obj_new, obj_new - obj_old))
+    }
+    
+    if (abs(obj_new - obj_old) < tol * (abs(obj_old) + 1e-8)) {
+      if (verbose) cat("Lp-KPCA converged.\n")
+      obj_old <- obj_new
+      break
+    }
+    
+    obj_old <- obj_new
+  }
+  
+  list(
+    w = model$w,
+    Kc = model$Kc,
+    lam = model$lam,
+    alpha = model$alpha,
+    E = E,
+    obj = obj_old
+  )
+}
+
+############################################################
+## 10. CV: Lp-KPCA (p-grid) with precomputed K_full, folds
+############################################################
+
+cv_lp_kpca_irls_K <- function(K_full, y, folds,
+                              p_grid   = c(2.0, 1.5, 1.0),
+                              r        = 2,
+                              max_iter = 20,
+                              tol      = 1e-4,
+                              verbose  = TRUE) {
+  nfold <- max(folds)
+  results <- data.frame()
+  best_score <- -Inf
+  best_cfg <- NULL
+  
+  for (p in p_grid) {
+    auc_vec <- numeric(nfold)
+    
+    if (verbose) {
+      cat("========================================\n")
+      cat(sprintf("CV Lp-KPCA: p = %.2f\n", p))
+    }
+    
+    for (k in 1:nfold) {
+      train_idx <- which(folds != k)
+      val_idx   <- which(folds == k)
+      K_train <- K_full[train_idx, train_idx, drop = FALSE]
+      
+      fit <- lp_kpca_irls_weighted(
+        K        = K_train,
+        r        = r,
+        p        = p,
+        max_iter = max_iter,
+        tol      = tol,
+        verbose  = FALSE
+      )
+      
+      E_val <- reconstruction_error_oos_weighted(
+        K_full   = K_full,
+        train_idx = train_idx,
+        val_idx   = val_idx,
+        w_train   = fit$w,
+        lam       = fit$lam,
+        alpha     = fit$alpha
+      )
+      
+      auc_vec[k] <- roc_auc(E_val, y[val_idx])
+    }
+    
+    mean_auc <- mean(auc_vec, na.rm = TRUE)
+    
+    if (verbose) {
+      cat(sprintf("  -> mean CV AUC (Lp-KPCA) = %.4f\n", mean_auc))
+    }
+    
+    results <- rbind(
+      results,
+      data.frame(
+        p       = p,
+        mean_auc = mean_auc
+      )
+    )
+    
+    if (mean_auc > best_score) {
+      best_score <- mean_auc
+      best_cfg <- list(p = p)
+    }
+  }
+  
+  if (verbose) {
+    cat("========================================\n")
+    cat("Best Lp-KPCA hyperparameter (by CV AUC):\n")
+    print(best_cfg)
+    cat(sprintf("Best mean AUC = %.4f\n", best_score))
+  }
+  
+  # 전체 데이터에 대해 최적 p로 다시 학습
+  fit_best <- lp_kpca_irls_weighted(
+    K        = K_full,
+    r        = r,
+    p        = best_cfg$p,
+    max_iter = max_iter,
+    tol      = tol,
+    verbose  = TRUE
+  )
+  
+  list(
+    results    = results,
+    best       = best_cfg,
+    best_score = best_score,
+    fit        = fit_best
+  )
+}
+
+############################################################
+## 11. CV: LS-KPCA (p,q,lambda grid) with precomputed K_full, folds
+############################################################
+
+cv_ls_kpca_irls_K <- function(K_full, y, folds,
+                              p_grid      = c(2.0, 1.5, 1.0),
+                              q_grid      = c(1.0, 0.5),
+                              lambda_grid = c(0.5, 1.0, 2.0),
+                              r           = 2,
+                              max_iter    = 20,
+                              tol         = 1e-4,
+                              verbose     = TRUE) {
+  nfold <- max(folds)
+  results <- data.frame()
+  best_score <- -Inf
+  best_cfg <- NULL
+  
+  for (p in p_grid) {
+    for (q in q_grid) {
+      for (lam in lambda_grid) {
+        auc_vec <- numeric(nfold)
+        
+        if (verbose) {
+          cat("========================================\n")
+          cat(sprintf("CV LS-KPCA: (p,q,lambda) = (%.2f, %.2f, %.3f)\n",
+                      p, q, lam))
+        }
+        
+        for (k in 1:nfold) {
+          train_idx <- which(folds != k)
+          val_idx   <- which(folds == k)
+          K_train <- K_full[train_idx, train_idx, drop = FALSE]
+          
+          fit <- ls_kpca_irls_weighted(
+            K        = K_train,
+            r        = r,
+            p        = p,
+            q        = q,
+            lambda   = lam,
+            max_iter = max_iter,
+            tol      = tol,
+            verbose  = FALSE
+          )
+          
+          scores_val <- outlier_score_oos_ls(
+            K_full   = K_full,
+            train_idx = train_idx,
+            val_idx   = val_idx,
+            w_train   = fit$w,
+            lam       = fit$lam,
+            alpha     = fit$alpha,
+            p         = p,
+            q         = q,
+            lambda    = lam
+          )
+          
+          auc_vec[k] <- roc_auc(scores_val$s, y[val_idx])
+        }
+        
+        mean_auc <- mean(auc_vec, na.rm = TRUE)
+        
+        if (verbose) {
+          cat(sprintf("  -> mean CV AUC (LS-KPCA) = %.4f\n", mean_auc))
+        }
+        
+        results <- rbind(
+          results,
+          data.frame(
+            p        = p,
+            q        = q,
+            lambda   = lam,
+            mean_auc = mean_auc
+          )
+        )
+        
+        if (mean_auc > best_score) {
+          best_score <- mean_auc
+          best_cfg <- list(p = p, q = q, lambda = lam)
+        }
+      }
+    }
+  }
+  
+  if (verbose) {
+    cat("========================================\n")
+    cat("Best LS-KPCA hyperparameters (by CV AUC):\n")
+    print(best_cfg)
+    cat(sprintf("Best mean AUC = %.4f\n", best_score))
+  }
+  
+  # 전체 데이터에 대해 최적 (p,q,lambda)로 다시 학습
+  fit_best <- ls_kpca_irls_weighted(
+    K        = K_full,
+    r        = r,
+    p        = best_cfg$p,
+    q        = best_cfg$q,
+    lambda   = best_cfg$lambda,
+    max_iter = max_iter,
+    tol      = tol,
+    verbose  = TRUE
+  )
+  
+  list(
+    results    = results,
+    best       = best_cfg,
+    best_score = best_score,
+    fit        = fit_best
+  )
+}
+
+############################################################
+## 12. Benchmark 전체 통합:
+##     - Baseline KPCA
+##     - Lp-KPCA (IRLS, p CV)
+##     - LS-KPCA (IRLS, p,q,lambda CV)
+############################################################
+
+run_benchmarks_for_dim <- function(d,
+                                   n = 600,
+                                   contamination = 0.1,
+                                   mu_shift = 6,
+                                   rho = 0.5,
+                                   r = 2,
+                                   nfold = 3,
+                                   seed_data  = 123,
+                                   seed_kernel = 1,
+                                   seed_cv    = 2025,
+                                   p_grid_lp  = c(2.0, 1.5, 1.0),
+                                   p_grid_ls  = c(2.0, 1.5, 1.0),
+                                   q_grid_ls  = c(1.0, 0.5),
+                                   lambda_grid_ls = c(0.5, 1.0, 2.0),
+                                   max_iter = 20,
+                                   tol = 1e-4,
+                                   verbose = TRUE) {
+  cat("####################################################\n")
+  cat(sprintf("Dimension d = %d\n", d))
+  
+  # 1) 데이터 생성
+  dat <- generate_data(
+    n = n, d = d,
+    contamination = contamination,
+    mu_shift = mu_shift,
+    rho = rho,
+    seed = seed_data
+  )
+  X <- dat$X
+  y <- dat$y
+  
+  # 2) 커널
+  set.seed(seed_kernel)
+  ker <- rbf_kernel(X)
+  K_full <- ker$K
+  sigma  <- ker$sigma
+  cat(sprintf("RBF sigma (median heuristic) = %.3f\n", sigma))
+  
+  n_obs <- nrow(X)
+  
+  # 3) CV folds
+  set.seed(seed_cv)
+  folds <- sample(rep(1:nfold, length.out = n_obs))
+  
+  # 4) Baseline KPCA (uniform weights)
+  w_unif <- rep(1 / n_obs, n_obs)
+  base_model <- weighted_kpca_from_weights(K_full, w_unif, r = r)
+  E_base <- base_model$E
+  auc_base <- roc_auc(E_base, y)
+  cat(sprintf("Baseline KPCA AUC (E_i as score) = %.3f\n", auc_base))
+  
+  # 5) Lp-KPCA (IRLS, p CV)
+  lp_cv <- cv_lp_kpca_irls_K(
+    K_full  = K_full,
+    y       = y,
+    folds   = folds,
+    p_grid  = p_grid_lp,
+    r       = r,
+    max_iter = max_iter,
+    tol      = tol,
+    verbose  = verbose
+  )
+  fit_lp <- lp_cv$fit
+  auc_lp <- roc_auc(fit_lp$E, y)
+  cat(sprintf("Lp-KPCA (best p=%.2f) AUC = %.3f\n",
+              lp_cv$best$p, auc_lp))
+  
+  # 6) LS-KPCA (IRLS, p,q,lambda CV)
+  ls_cv <- cv_ls_kpca_irls_K(
+    K_full       = K_full,
+    y            = y,
+    folds        = folds,
+    p_grid       = p_grid_ls,
+    q_grid       = q_grid_ls,
+    lambda_grid  = lambda_grid_ls,
+    r            = r,
+    max_iter     = max_iter,
+    tol          = tol,
+    verbose      = verbose
+  )
+  fit_ls <- ls_cv$fit
+  auc_ls <- roc_auc(fit_ls$s, y)
+  cat(sprintf("LS-KPCA (best p=%.2f, q=%.2f, lambda=%.3f) AUC = %.3f\n",
+              ls_cv$best$p, ls_cv$best$q, ls_cv$best$lambda, auc_ls))
+  
+  # 결과 요약 data.frame
+  summary_df <- data.frame(
+    method = c("KPCA", "Lp-KPCA", "LS-KPCA"),
+    d      = d,
+    auc    = c(auc_base, auc_lp, auc_ls)
+  )
+  
+  list(
+    summary   = summary_df,
+    base_auc  = auc_base,
+    lp_cv     = lp_cv,
+    ls_cv     = ls_cv,
+    K_full    = K_full,
+    X         = X,
+    y         = y
+  )
+}
+
+############################################################
+## 13. 예시 실행: d ∈ {2, 4, 16, 256}
+############################################################
+
+dims <- c(2, 4, 16)
+
+benchmark_results <- lapply(dims, function(dd) {
+  run_benchmarks_for_dim(
+    d = dd,
+    n = 600,
+    contamination = 0.1,
+    r = 2,
+    nfold = 3,
+    # 그리드 크면 오래 걸리니까 적당히 조절
+    p_grid_lp  = c(2.0, 1.5, 1.0, 0.5, 0.1),
+    p_grid_ls  = c(2.0, 1.5, 1.0, 0.5, 0.1),
+    q_grid_ls  = c(2.0, 1.5, 1.0, 0.5, 0.1),
+    lambda_grid_ls = c(0.1, 0.3, 0.5, 0.7, 1.0,1.3,1.5),
+    max_iter = 50,
+    tol = 1e-4,
+    verbose = TRUE
+  )
+})
+
+# 각 차원별 summary만 모으기
+summary_all_dims <- do.call(rbind, lapply(benchmark_results, `[[`, "summary"))
+print(summary_all_dims)
+
+```
+
